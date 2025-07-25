@@ -1,0 +1,765 @@
+---
+title: "Contructing the optimal currency portfolio"
+author: "Maximilian Michlits"
+header-includes:
+   - \usepackage{bbm}
+date: "r Sys.Date()"
+output: html_document
+---
+
+Starting off by loading libraries and the data.
+```{r, include = FALSE}
+library(dplyr)
+library(tidyr)
+library(zoo)
+library(ggplot2)
+library(lubridate)
+```
+
+```{r}
+#load data sets
+fx_data <- get(load("Data/fx_data.RData"))
+spot_daily <- get(load("Data/spot.RData"))
+rm(spot)
+
+# Set Parameters
+## Regression Parameters
+window_size = Inf # Inf for expanding, used 120 for rolling
+burn_in = 25 # I usually used 25
+
+## Covariance Parameter
+lambda = 0.94 # 0.94 exponential decay from paper
+robust_linear_shrinkage = TRUE
+linear_shrinkage = FALSE
+
+## Result storage
+results_folder <- "Results/" # Name of results folder (don't forget to put "/" at the end)
+
+# tmp fixes
+## get rid of incomplete present month
+spot_daily <- spot_daily %>%
+  mutate(
+    date = as.Date(date), 
+    month = as.Date(ceiling_date(date, unit = "month")-1)) %>%
+  filter(month != max(month))
+
+## round up to eom data
+fx_data <- as.data.frame(fx_data)
+fx_data <- fx_data %>%
+  mutate(date = ceiling_date(date, unit = "month") - days(1))
+
+#display df
+head(fx_data %>% na.omit %>% arrange(sample(n())), 10) %>% arrange(date) #only end of month data has cpi and forwards
+```
+Let's make ourselfs aware that our monthly data is an unbalanced panel
+```{r}
+fx_data %>%
+  group_by(currency) %>%
+  summarise(
+    min_date = min(date, na.rm = TRUE),
+    max_date = max(date, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  knitr::kable()
+```
+
+
+Let $S_t^i$ be the spot exchange rate and $F_t^i$ the one month forward exchange rate of country $i$ in month $t$. We first need to compute excess returns. For this, we follow "Pricing Currency Risks" and go with the formula:
+$$
+R^{e,i}_{t+1} = (S^i_{t+1}-F^i_t)/F_t^i
+$$
+This definition makes sense intuitively as if one would lock in some exchange rate via a one month forward at time $t$, the payoff at time $t+1$ is the difference between the spot (i.e. the real value the currency has at this later time) minus the locked in forward rate (i.e. the price one payed for the currency). One can divide this payoff by the forward rate at time $t$ to scale the payoff to "one forward USD". The rates are in USD per foreign currency terms.
+
+```{r}
+fx_data <- fx_data %>%
+  group_by(currency) %>%
+  mutate(return = (lead(spot_USD_per_CCY) - forward_USD_per_CCY) / forward_USD_per_CCY) %>%
+  ungroup()
+```
+
+[Theory on where $\Omega$ comes from and what it is used for]
+
+# Estimation of Omega
+
+We want to estimate $\Omega$. To achieve this we first need an estimate of the covariance. We use the realized covariance matrix which is the best linear unbiased estimator (is it????), then smooth it.
+
+We estimate via the following formula:
+$$
+\hat\Sigma_t = \sum_{j=1}^{D_t} X_{j,t} X_{j,t}^\top
+$$
+where $X_{j,t}$ represents the vector containing all all observations of percentage changes in spot rates of USD per foreign currency at date $(j,t)$. $D_t$ is the number of trading days in month $t$. Therefore, $X$ is double indexed by the month and day. This approach makes sense compared to just using days as different months have different numbers of trading days and it is easier to code this way. So let's compute $\hat\Sigma_t$.
+```{r, warning=FALSE}
+#prepare daily spot data
+spot_daily <- spot_daily %>%
+  mutate(
+    date = as.Date(date), 
+    month = as.Date(ceiling_date(date, unit = "month")-1)) %>%
+  group_by(currency) %>%
+  mutate(pct_change = spot_USD_per_CCY / lag(spot_USD_per_CCY) - 1) %>%
+  ungroup() %>%
+  select(date, currency, pct_change, month)
+```
+
+We check for outliers in this data by using the IQR method embedded in ggplot2::geom_boxplot.
+```{r}
+library(scales)
+
+# --- FUNCTION TO TAG OUTLIERS USING ASYMMETRIC IQR ---
+tag_asymmetric_outliers <- function(data, value_col) {
+  data %>%
+    filter(!is.na(.data[[value_col]])) %>%
+    group_by(currency) %>%
+    mutate(
+      Q1 = quantile(.data[[value_col]], 0.25),
+      Q2 = quantile(.data[[value_col]], 0.50),
+      Q3 = quantile(.data[[value_col]], 0.75),
+      IQR = Q3 - Q1,
+      SIQR_L = Q2 - Q1,
+      SIQR_U = Q3 - Q2,
+      f_L_RS = Q1 - 1.5 * IQR * (SIQR_L / SIQR_U),
+      f_U_RS = Q3 + 1.5 * IQR * (SIQR_U / SIQR_L),
+      is_outlier = .data[[value_col]] < f_L_RS | .data[[value_col]] > f_U_RS
+    ) %>%
+    ungroup()
+}
+
+# --- FUNCTION TO CREATE CUSTOM BOXPLOT ---
+plot_asym_iqr_boxplot <- function(data, value_col, y_label) {
+  ggplot(data, aes(x = currency, y = .data[[value_col]])) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(
+      data = filter(data, is_outlier),
+      aes(color = is_outlier),
+      shape = 21, size = 2, width = 0.2, alpha = 0.7, fill = "firebrick"
+    ) +
+    theme_minimal(base_size = 14) +
+    labs(x = "Currency", y = y_label) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+    scale_color_manual(values = c("TRUE" = "firebrick"), guide = "none")
+}
+
+# --- DAILY DATA ---
+daily_tagged <- tag_asymmetric_outliers(spot_daily, "pct_change")
+plot_asym_iqr_boxplot(daily_tagged, "pct_change", "Daily pct_change")
+
+# --- MONTHLY DATA ---
+monthly_tagged <- tag_asymmetric_outliers(fx_data, "return")
+plot_asym_iqr_boxplot(monthly_tagged, "return", "Monthly Return")
+
+# --- OUTLIER SHARE ---
+daily_outlier_pct <- mean(daily_tagged$is_outlier, na.rm = TRUE)
+monthly_outlier_pct <- mean(monthly_tagged$is_outlier, na.rm = TRUE)
+
+cat("Asymmetric IQR - Daily Outlier %:", round(daily_outlier_pct * 100, 2), "%\n")
+cat("Asymmetric IQR - Monthly Outlier %:", round(monthly_outlier_pct * 100, 2), "%\n")
+
+# --- CLEANUP ---
+rm(daily_tagged, monthly_tagged, daily_outlier_pct, monthly_outlier_pct, tag_asymmetric_outliers, plot_asym_iqr_boxplot)
+```
+
+Additionally, we want to compute the Mahalanbis Distance of predicted values in daily and monthly data sets. We cannot visualize them as we would get a 10 dimensional ellipse but we can still use it for detection.
+```{r}
+robust_mahalanbis_distance <-  function(data, variables_from, values_from){
+  
+  data <- data %>% select(variables_from, values_from, date)
+  
+  mahalanobis_target <- data %>%
+  pivot_wider(names_from = variables_from, values_from = values_from) %>%
+  select(-date)
+  
+  na_free_mahalanobis_target <- na.omit(mahalanobis_target)
+
+  tmp_MCD_output <- rrcov::CovMcd(na_free_mahalanobis_target)
+  
+  distances <- mahalanobis(na_free_mahalanobis_target,
+            center = tmp_MCD_output$center,
+            cov = tmp_MCD_output$cov
+            )
+  
+  cutoff <- qchisq(p = 0.95 , df = ncol(na_free_mahalanobis_target))
+  
+  outliers <- na_free_mahalanobis_target[distances > cutoff, ]
+  
+  return(print(
+    paste0("Having NAs in ",
+           round(100 * (1 - nrow(na_free_mahalanobis_target) / nrow(mahalanobis_target)) ,2),
+           "% of the data, we flag ",
+           round(100 * nrow(outliers)/nrow(data),2),
+           "% as outliers")))
+}
+
+# monthly data
+robust_mahalanbis_distance(
+  data = fx_data %>% filter(currency %in% unique(fx_data$currency)[-10]), #KRW causes 50% NAs
+  variables_from = "currency",
+  values_from = "return")
+
+#daily_data
+robust_mahalanbis_distance(
+  data = spot_daily %>% filter(currency %in% unique(fx_data$currency)[-10]), #KRW causes 50% NAs
+  variables_from = "currency",
+  values_from = "pct_change")
+```
+
+
+As we can see, there are some outliers in the spot data. If they are influential is not clear at this point.
+
+Then we continue with some smoothing methods they used in "Pricing Currency Risks". 
+
+Recognize that the exponentially smoothed covariance matrix is estimated with daily spot data going partly back as far as 1980-01-02 while forwards are starting to be available at 1982-01-29. This implies that the first cov estimation uses two years of data for estimation.
+
+
+```{r}
+#define all currencies
+all_currencies <- sort(unique(spot_daily$currency))
+n_currencies <- length(all_currencies)
+
+#initialize the covariance matrix list
+tmp_months <- unique(spot_daily$month)
+tmp_cov_realized <- vector("list", length = length(tmp_months))
+names(tmp_cov_realized) <- as.character(tmp_months)
+
+for (t in seq_along(tmp_months)) {
+  
+  tmp_data <- spot_daily %>%
+    filter(month == tmp_months[t]) %>%
+    pivot_wider(names_from = currency, values_from = pct_change) %>%
+    select(-c(1:2)) %>%
+    drop_na()
+  
+  if(linear_shrinkage) sub_cov <- corpcor::cov.shrink(tmp_data, verbose = FALSE)
+  
+  if(robust_linear_shrinkage) sub_cov <- rrcov::CovMrcd(x = tmp_data,
+                                                        alpha = 0.75,
+                                                        maxcsteps = 100)$cov
+  
+
+  
+  #create full matrix with zeros
+  full_cov <- matrix(0, nrow = n_currencies, ncol = n_currencies)
+  rownames(full_cov) <- colnames(full_cov) <- all_currencies
+  
+  #insert sub_cov into appropriate rows/columns
+  available_currencies <- colnames(tmp_data)
+  full_cov[available_currencies, available_currencies] <- sub_cov
+  
+  tmp_cov_realized[[t]] <- full_cov
+}
+ 
+rm(all_currencies, n_currencies, tmp_data,
+   available_currencies, sub_cov, full_cov)
+
+#exp weighted average
+tmp_omega_list <- vector("list", length = length(tmp_cov_realized)-1)
+names(tmp_omega_list) <- names(tmp_cov_realized)[-1]
+
+tmp_omega_list[[1]] <- tmp_cov_realized[[1]]
+
+for (t in 2:length(tmp_cov_realized)) {
+  tmp_omega_list[[t]] <- (1-lambda)*tmp_cov_realized[[t]] + lambda*tmp_omega_list[[t-1]]
+}
+rm(t, tmp_cov_realized, lambda)
+
+#multiply diagonal matrix with forward/spot as diag-values with omega matrix to obtain estimate
+cov_estimates <- vector("list", length = length(tmp_months))
+names(cov_estimates) <- as.character(tmp_months)
+
+for (t in 1:length(tmp_omega_list)){
+  tmp_names <- attr(tmp_omega_list[[t]], "dimnames")[[1]]
+  
+  tmp_diag_matrix <-
+    matrix(data = 0,
+           nrow = length(tmp_names),
+           ncol = length(tmp_names))
+  rownames(tmp_diag_matrix) <- colnames(tmp_diag_matrix) <- tmp_names
+  
+  for (currency_i in tmp_names) {
+  tmp_val <- fx_data %>%
+    filter(currency == currency_i) %>%
+    group_by(month = as.yearmon(date)) %>%
+    filter(date == max(date)) %>%
+    ungroup() %>%
+    filter(as.Date(date) == tmp_months[t]) %>%
+    summarize(value = mean(spot_USD_per_CCY / forward_USD_per_CCY, na.rm = TRUE)) %>%
+    pull(value)
+  
+  if (length(tmp_val) == 0 || is.na(tmp_val)) {
+    tmp_diag_matrix[currency_i, currency_i] <- 0
+  } else {
+    tmp_diag_matrix[currency_i, currency_i] <- tmp_val
+  }
+}
+  
+  cov_estimates[[t]] <- tmp_omega_list[[t]] * (diag(tmp_diag_matrix) %o% diag(tmp_diag_matrix))
+  
+}
+rm(currency_i, t, tmp_months, tmp_names, tmp_val,
+   tmp_omega_list, tmp_diag_matrix, spot_daily)
+```
+
+
+Construct the factors following "Pricing Currency Risk" from [AUTHORS].
+
+We start off with a RER based signal. It is computed as follows:
+$$ Q_t^i = S_t^i \cdot \frac{P_t^i}{P_t} $$ 
+where $Q_t^i$ is the RER, $S_t^i$ the spot rate,$P_t^i$ the consumer price index of currency $i$ at time $t$ and $P_t$ the consumer price index of the United States at time $t$.
+
+Then we use a moving average as the idea behind the factor is mean reversion:
+$$  \tilde{Q_t^i} = Q_t^i \cdot \left( \frac{1}{13} \cdot \sum_{j=-6}^6 Q_{t-60+j}^i \right)^{-1} $$
+
+And finally we demean the cross section in the following way to get our final signal:
+$$ z_{Q_t}^i =  \tilde{Q_t^i} - \frac{1}{N_t} \sum_{i=1}^{N_t} \tilde{Q_t^i}$$
+where $N_t$ is the number of considered currencies for the given date. (Note: This could be an issue as the signals moments might differ depending on $N_t$ imposing some bias in the linear model when I consider different currencies. Maybe I can test for heteroskedasticity here.)
+
+```{r}
+# Compute RER
+fx_data <- fx_data %>%
+  group_by(currency) %>%
+  arrange(date) %>%
+  mutate(RER = spot_USD_per_CCY * cpi / cpi_US) %>%
+  ungroup()
+
+#use slider::slide_dbl to apply to a rolling window through the data frame
+fx_data <- fx_data %>%
+  group_by(currency) %>%
+  mutate(
+    RER_ma_t_minus_60 = lag(
+      slider::slide_dbl(
+        RER,
+        .f = ~ mean(.x, na.rm = TRUE),
+        .before = 6,
+        .after = 6,
+        .complete = TRUE
+      ),
+      n = 60
+    ),
+    RER_norm = RER / RER_ma_t_minus_60
+  ) %>%
+  ungroup() %>% 
+  select(-c("RER_ma_t_minus_60", "RER"))
+
+#Impose demeaning in the cross section
+fx_data <- fx_data %>%
+  group_by(date) %>%
+  mutate(
+    z_Q = RER_norm - mean(RER_norm, na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+The other ones are simpler to compute and will be done in one go. We have a normalized forward discount signal and a 12 month depreciation rate. The normalized forward discount looks like this: $\text{FD}_t^i = S_t^i/F_t^i-1$, and the Momentum like this: $\text{MOM}_t^i = S_t^i/S_{t-12}^i-1$. Additionally, we add the change in the spot rate from time $t$ until $t+1$. This is a look into the future and we want to estimate it soon.
+```{r}
+fx_data <- fx_data %>%
+  group_by(currency) %>%
+  mutate(
+    fwd_disc = spot_USD_per_CCY/forward_USD_per_CCY - 1,
+    mom_12m = spot_USD_per_CCY/lag(spot_USD_per_CCY, 12) - 1,
+    spot_change = lead(spot_USD_per_CCY)/spot_USD_per_CCY -1    
+    ) %>%
+  ungroup() %>%
+  select(-RER_norm)
+```
+
+The assumed true forecasting model is:
+
+$$
+\mu_t^i = 1 \cdot \text{FD}_t^i + \beta_{1,t}^i \cdot z_{Q_t}^i + \beta_{2,t}^i \cdot \text{MOM}_t^i
+$$
+Note that there is no intercept, the first coefficient is assumed to be $1$ and that for every currency $i$ and time $t$ the respective $\beta_{j,t}^i$ might differ ($j \in 	\{1,2\}$).
+
+We get there in two steps. First, we forecast percentage changes in spot rates via 
+$$
+\frac{S_{t+1}^i}{S_t^i} - 1 = \hat\beta_{1,t}^i \cdot z_{Q_t}^i + \hat\beta_{2,t}^i \cdot \text{MOM}_t^i + \epsilon_{t+1}^i
+$$
+
+We estimate $\hat\beta_{1,t}^i$ and $\hat\beta_{2,t}^i$ by doing a pooled panel regression. We use only observations from currency $i$ and an expanding window from the respective currencies first observation until time $t$, where we will set the minimum number of observations to $12$.
+
+But first we visualize the panel data via a grouped by currency time series.
+```{r}
+# Calculate 12-month rolling average of returns per currency
+plot_data <- fx_data %>%
+  arrange(currency, date) %>%
+  group_by(currency) %>%
+  mutate(return_roll12 = slider::slide_dbl(return, mean, .before = 12, .complete = FALSE, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(!is.na(return_roll12))
+
+# Time series plot
+ggplot(plot_data, aes(x = date, y = return_roll12, color = currency)) +
+  geom_line(linewidth = 1) +
+  labs(
+    #title = "Smoothed Returns by Currency",
+    x = "Date",
+    y = "Smoothed Return",
+    color = "Currency"
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+rm(plot_data)
+```
+
+We regress each dates currency factors with the associated spot changes.
+```{r}
+#initialize result columns
+fx_data$beta_1 <- NA
+fx_data$beta_2 <- NA
+fx_data$R_val <- NA
+fx_data$p_val_1 <- NA
+fx_data$p_val_2 <- NA
+fx_data$exp_return <- NA
+
+
+# get all unique dates after burn-in
+all_dates <- fx_data %>% filter(!is.na(z_Q), !is.na(mom_12m), !is.na(fwd_disc)) %>% pull(date) %>% unique() %>% sort() 
+
+for (t_idx in burn_in:length(all_dates)) {
+  
+  if (t_idx %% 10 == 0 || t_idx == length(all_dates)) {
+  print(paste0("Progress: ", round(100 * (t_idx - burn_in) / (length(all_dates) - burn_in), 2), "%"))
+  }
+  
+  #regress in certain range
+  start_date <- all_dates[(max(t_idx-window_size,1))]
+  end_date <- all_dates[t_idx]
+  
+  window_data <- fx_data %>%
+    filter(date <= end_date, date >= start_date) %>%
+    filter(!is.na(spot_change), !is.na(z_Q), !is.na(mom_12m))
+  
+  #enforce balanced panels via dropping currencies that appear not at every unique date
+  #n_dates <- length(unique(window_data$date))
+
+  #currency_counts <- window_data %>%
+  # group_by(currency) %>%
+  #  summarise(n = n_distinct(date)) %>%
+  #  filter(n == n_dates) %>%
+  #  pull(currency)
+
+  #window_data <- window_data %>%
+  #  filter(currency %in% currency_counts)
+  
+  #perform the balanced panel regression
+  model <- plm::plm(
+    spot_change ~ 0 + z_Q + mom_12m,
+    data = window_data,
+    index = c("currency", "date"),
+    model = "pooling"
+  )
+  
+  #we use newey west correction (HAC) against homosced. and autocorr.
+  nw_summary <- summary(model, vcov = plm::vcovNW)
+  coefs <- nw_summary$coefficients[, "Estimate"]
+  pvals <- nw_summary$coefficients[, "Pr(>|t|)"]
+  r2 <- summary(model)$r.squared[1]
+  
+  pred_data <- fx_data %>% #fitted values for current date only
+    filter(date == end_date, !is.na(z_Q), !is.na(mom_12m)) %>%
+    mutate(exp_return = as.numeric(predict(model, newdata = .))) %>%
+    select(currency, date, exp_return)
+  
+  #assign values to all rows with date == end_date
+  fx_data <- fx_data %>%
+    mutate(
+      beta_1 = if_else(date == end_date, coefs["z_Q"], beta_1),
+      beta_2 = if_else(date == end_date, coefs["mom_12m"], beta_2),
+      R_val = if_else(date == end_date, r2, R_val),
+      p_val_1 = if_else(date == end_date, pvals["z_Q"], p_val_1),
+      p_val_2 = if_else(date == end_date, pvals["mom_12m"], p_val_2)
+    ) %>%
+    left_join(pred_data, by = c("currency", "date")) %>%
+    mutate(exp_return = coalesce(exp_return.y, exp_return.x)) %>%
+    select(-exp_return.x, -exp_return.y)
+
+}
+
+rm(all_dates, coefs, start_date, pvals, r2, end_date, t_idx,
+   window_data, pred_data,
+   model, nw_summary)
+```
+
+We visualize the balanced panel regression.
+```{r, warning=FALSE}
+# Plot regression coefficients over time
+fx_data %>%
+  filter(!is.na(beta_1), !is.na(beta_2)) %>%
+  select(date, beta_1, beta_2) %>%
+  distinct() %>%  # One value per date
+  pivot_longer(
+    cols = starts_with("beta"),
+    names_to = "coefficient",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = date, y = value, color = coefficient)) +
+  geom_line(size = 1) +
+  labs(
+    #title = "Regression Coefficients Over Time",
+    x = "Date",
+    y = "Coefficient Value",
+    color = "Coefficient"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Plot coefficient p-values over time
+fx_data %>%
+  filter(!is.na(p_val_1), !is.na(p_val_2)) %>%
+  select(date, p_val_1, p_val_2) %>%
+  distinct() %>%  # One value per date
+  pivot_longer(
+    cols = starts_with("p_val"),
+    names_to = "p_values",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = date, y = value, color = p_values)) +
+  geom_line(size = 1) +
+  labs(
+    #title = "Coefficients p-values Over Time",
+    x = "Date",
+    y = "p-values",
+    color = "Coefficient"
+  ) +
+  theme_minimal(base_size = 12) +
+  geom_hline(yintercept = 0.05, color = "blue")
+
+# Plot R-squared over time
+fx_data %>%
+  filter(!is.na(R_val)) %>%
+  select(date, R_val) %>%
+  distinct() %>%
+  ggplot(aes(x = date, y = R_val)) +
+  geom_line(color = "steelblue", size = 1) +
+  labs(
+    #title = "R² Over Time",
+    x = "Date",
+    y = "R-squared"
+  ) +
+  theme_minimal(base_size = 12) +
+  ylim(0, 0.1)
+```
+
+Interestingly, between 2002 and 2008 both factors were significant. Before 2002 both were not, while after 2008 the Momentum factor seems to be not significant anymore, while the RER based coefficient remains very much significant until today.
+
+Secondly, we use this expectation of spot change to compute the expected excess currency returns via:
+
+$$
+\mu_t^i = 1 \cdot \text{FD}_t^i + \frac{S_t^i}{F_t^i} \hat\beta_{1,t} z_{Q_t}^i + \frac{S_t^i}{F_t^i} \hat\beta_{2,t} \text{MOM}_t^i
+$$
+
+```{r}
+fx_data <- fx_data %>%
+  mutate(exp_return =
+           1*fwd_disc + 
+           spot_USD_per_CCY/forward_USD_per_CCY * beta_1 * z_Q +
+           spot_USD_per_CCY/forward_USD_per_CCY * beta_2 * mom_12m)
+```
+
+Now that we have return expectations and covariance estimates we can compute the optimal portfolio weights (i.e. the weights of currencies that maximizes the Sharp Ratio which measures the return-risk ratio) with this formula:
+
+$$
+w_t^*=\frac{1}{1+\mu_t^\top\Omega_t^{-1}\mu_t}\Omega_t^{-1}\mu_t
+$$
+
+where $\mu_t=\left(\mu_t^1, \cdots, \mu_t^n\right)^\top$ with $n$ being the number of currencies.
+
+```{r}
+#initialize a list of named vectors
+portfolio_weights <-
+  vector(mode = "list", length = length(cov_estimates))
+names(portfolio_weights) <- names(cov_estimates)
+portfolio_weights <- 
+  lapply(seq_along(portfolio_weights), function(i) {
+  setNames(
+    rep(NA_real_,
+        length(rownames(cov_estimates[[1]]))),
+    rownames(cov_estimates[[1]]))
+    })
+names(portfolio_weights) <- names(cov_estimates)
+
+#compute the weights for every date
+for (current_date in names(cov_estimates)) {
+  current_cov_est_mat <- cov_estimates[[current_date]]
+  currency_names <- rownames(current_cov_est_mat)
+  
+  current_exp_ret_vec <- setNames(
+    sapply(currency_names, function(current_currency) {
+      fx_data$exp_return[fx_data$date == as.Date(current_date) & fx_data$currency == current_currency]
+    }),
+    currency_names
+  )
+  
+  #we have to handle dynamically if data is available or not.
+  #step 1: find currencies with non-zero variance AND non-NA expected return
+  present_currencies <- currency_names[
+    diag(current_cov_est_mat) != 0 & !is.na(current_exp_ret_vec)
+  ]
+
+  #step 2: subset matrix and expected returns vector
+  sub_cov <-
+    current_cov_est_mat[
+      present_currencies, present_currencies, drop = FALSE
+      ]
+  sub_mu  <- as.numeric(current_exp_ret_vec[present_currencies])
+  names(sub_mu) <- present_currencies
+  
+    #step 3: compute weights using the formula (only if enough data)
+    if (length(present_currencies) >= 2 ) {
+      inv_cov <- solve(sub_cov)
+      scalar <- as.numeric(1 / (1 + t(sub_mu) %*% inv_cov %*% sub_mu))
+      weights_sub <- scalar * (inv_cov %*% sub_mu)
+      
+      #step 4: insert into full-length named vector (0s for missing currencies)
+      full_weights <- setNames(rep(0, length(currency_names)), currency_names)
+      full_weights[present_currencies] <- as.numeric(weights_sub)
+      
+      #step 5: store
+      portfolio_weights[[current_date]] <- full_weights
+    } else {
+      #too few currencies => all weights 0
+      portfolio_weights[[current_date]] <- setNames(rep(0, length(currency_names)), currency_names)
+    }
+}
+
+rm(current_cov_est_mat, current_date, current_exp_ret_vec,
+   sub_cov, weights_sub, sub_mu, full_weights,
+   currency_names, present_currencies,
+   scalar, inv_cov)
+```
+
+Finally we want to know how the UMVE portfolio would have performed. We compute UMVE portfolio returns as $R_t^* = (R_t^1,...,R_t^N)\cdot w_t^*$.
+```{r}
+#initialize storage
+portfolio <- data.frame(
+  date = as.Date(names(cov_estimates)),
+  return = 0,
+  weights_sum = 0,
+  equal_weight_return = 0
+)
+for (current_date in portfolio$date) {
+
+  #pull weights and returns
+  current_date <- as.Date(current_date)
+
+  current_weights <- portfolio_weights[[as.character(current_date)]]
+  
+  current_returns <- fx_data %>%
+    filter(date == current_date) %>%
+    select(currency, return) %>%
+    tibble::deframe()
+  
+  #match return vector to weight vector names
+  matched_returns <- current_returns[names(current_weights)]
+  
+  #compute weighted return and sum of weights at time t
+  portfolio$return[portfolio$date == current_date] <-
+    sum(current_weights * matched_returns, na.rm = TRUE)
+  
+  portfolio$weights_sum[portfolio$date == current_date] <-
+    sum(current_weights, na.rm = TRUE)
+  
+  #compute equal weight return
+  portfolio$equal_weight_return[portfolio$date == current_date] <-
+    mean(matched_returns, na.rm = TRUE)
+}
+
+#cut off no trading period
+portfolio <- portfolio %>% filter(return != 0)
+
+#add cumulative return
+portfolio <- portfolio %>%
+  arrange(date) %>%
+  mutate(cum_return = cumsum(return),
+         cum_return_equal_weights = cumsum(equal_weight_return))
+
+rm(current_date, current_weights, current_returns,
+   matched_returns)
+```
+
+Let's plot the portfolio.
+```{r, warning=FALSE}
+portfolio <- portfolio %>%
+  arrange(date) %>%
+  mutate(
+    cum_return = cumsum(return),
+    cum_return_equal_weights = cumsum(equal_weight_return)
+  )
+
+# Define rescale factor
+max_opt <- max(portfolio$cum_return, na.rm = TRUE)
+max_eqw <- max(portfolio$cum_return_equal_weights, na.rm = TRUE)
+scale_factor <- max_opt / max_eqw
+
+portfolio_time_series <- ggplot(portfolio, aes(x = date)) +
+  geom_line(aes(y = cum_return, color = "Optimized Portfolio"), size = 1) +
+  geom_line(aes(y = cum_return_equal_weights * scale_factor, color = "Equal-Weighted Portfolio"), size = 1) +
+  scale_y_continuous(
+    name = "Cumulative Return (Optimized Portfolio)",
+    sec.axis = sec_axis(~ . / scale_factor, name = "Cumulative Return (Equal-Weighted Portfolio)")
+  ) +
+  scale_color_manual(
+    values = c("Optimized Portfolio" = "forestgreen", "Equal-Weighted Portfolio" = "steelblue"),
+    name = "Strategy"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title.y.left = element_text(color = "forestgreen"),
+    axis.title.y.right = element_text(color = "steelblue")
+  ) +
+  labs(x = "Date")
+
+show(portfolio_time_series)
+
+
+portfolio_return_distribution <- ggplot(portfolio, aes(x = return)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  theme_minimal(base_size = 14) +
+  labs(
+    #title = "Distribution of Monthly Portfolio Returns",
+    x = "Monthly Return",
+    y = "Frequency"
+  )
+
+show(portfolio_return_distribution)
+
+ggplot(portfolio, aes(x = weights_sum)) +
+  geom_histogram(bins = 30, fill = "darkorange", color = "white") +
+  theme_minimal(base_size = 14) +
+  labs(
+    #title = "Distribution of Portfolio Weights Sum",
+    x = "Sum of Weights",
+    y = "Frequency"
+  )
+
+ggplot(portfolio, aes(x = date, y = weights_sum)) +
+  geom_line(color = "firebrick", size = 1) +
+  theme_minimal(base_size = 14) +
+  labs(
+    #title = "Portfolio Weights Sum Over Time",
+    x = "Date",
+    y = "Sum of Weights"
+  )
+
+#save portfolio, as well as first and second plot
+save(portfolio, file = paste0(results_folder, "portfolio_", "burn_in_", burn_in, "_linear_shrinkage_", linear_shrinkage, "_robust_linear_shrinkage_", robust_linear_shrinkage, "_window_size_", window_size, ".RData"))
+save(portfolio_time_series, file = paste0(results_folder, "portfolio_time_series", "burn_in_", burn_in, "_linear_shrinkage_", linear_shrinkage, "_robust_linear_shrinkage_", robust_linear_shrinkage, "_window_size_", window_size, ".png"))
+save(portfolio_return_distribution, file = paste0(results_folder, "portfolio_return_distribution", "burn_in_", burn_in, "_linear_shrinkage_", linear_shrinkage, "_robust_linear_shrinkage_", robust_linear_shrinkage, "_window_size_", window_size, ".png"))
+```
+
+# Comments from meetings 
+##16th of April
+panel data tests: one coeff for each currency or one coeff for all currencies (plm package for panel data)
+
+issues in cov estimation: high dimnsionality
+outliers? mcd minimum covariance determinant
+https://search.r-project.org/CRAN/refmans/robustbase/html/covMcd.html
+
+robust lm, robust base package lmrob
+
+# Notes on fixing coeffs
+They use 8 years of data in daily spot data as their dataset goes back until 1978, mine only 2 years.
+
+Compare their UMVE vs. strategies/currencies table with my results.
+
+##23rd of April
+Neway-West adjustment (switch to plm for panel data and use implementation) - correction of standard errors
